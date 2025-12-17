@@ -244,7 +244,192 @@ voice-mode whisper model install base.en --skip-core-ml=false
 The installation tool automatically detects and enables:
 - **Mac (Apple Silicon)**: Metal acceleration
 - **NVIDIA GPU**: CUDA acceleration
+- **AMD GPU**: ROCm/HIP acceleration (see below)
 - **CPU**: Optimized CPU builds
+
+### AMD ROCm/HIP Acceleration (Linux)
+
+For AMD GPUs on Linux, you can build whisper.cpp with HIP backend for GPU-accelerated transcription. This provides ~20x+ realtime performance on RDNA2/RDNA3 GPUs.
+
+#### Prerequisites
+
+```bash
+# Check ROCm is installed and working
+rocminfo | grep "gfx"  # Should show your GPU architecture
+
+# Check HIP compiler
+hipcc --version
+
+# Install if needed (Arch/CachyOS)
+sudo pacman -S cmake ninja rocm-hip-sdk
+
+# Install if needed (Ubuntu/Debian)
+# Follow AMD's ROCm installation guide for your distro
+```
+
+#### Build with HIP Backend
+
+```bash
+# Clone whisper.cpp
+cd ~/.voicemode/services
+git clone https://github.com/ggerganov/whisper.cpp.git
+cd whisper.cpp
+
+# Create build directory
+mkdir build && cd build
+
+# Configure with HIP backend
+# Adjust AMDGPU_TARGETS for your GPU:
+#   - gfx1100: RX 7900 XTX/XT
+#   - gfx1101: RX 7800 XT, 7700 XT
+#   - gfx1102: RX 7600
+#   - gfx1030: RX 6800/6900 series
+#   - gfx1031: RX 6700 XT
+cmake .. \
+  -DGGML_HIP=ON \
+  -DAMDGPU_TARGETS="gfx1100;gfx1101;gfx1102" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DWHISPER_BUILD_SERVER=ON
+
+# Build
+make -j$(nproc)
+
+# Download model
+cd ..
+./models/download-ggml-model.sh small.en
+
+# Test (should show ROCm device info)
+./build/bin/whisper-cli -m models/ggml-small.en.bin -f samples/jfk.wav
+```
+
+#### OpenAI-Compatible Proxy
+
+The whisper.cpp server uses `/inference` endpoint, but VoiceMode expects OpenAI's `/v1/audio/transcriptions`. A small proxy translates between formats.
+
+**Create venv and proxy script:**
+```bash
+cd ~/.voicemode/services
+python -m venv whisper-proxy-venv
+./whisper-proxy-venv/bin/pip install aiohttp
+```
+
+**Proxy script** (`~/.voicemode/services/whisper-proxy.py`):
+```python
+#!/usr/bin/env python3
+import aiohttp
+from aiohttp import web
+
+WHISPER_URL = "http://127.0.0.1:2022"
+
+async def health(request):
+    return web.json_response({"status": "ok"})
+
+async def transcriptions(request):
+    reader = await request.multipart()
+    audio_data = None
+    async for part in reader:
+        if part.name == "file":
+            audio_data = await part.read()
+    if not audio_data:
+        return web.json_response({"error": "No audio file"}, status=400)
+
+    data = aiohttp.FormData()
+    data.add_field("file", audio_data, filename="audio.wav", content_type="audio/wav")
+    data.add_field("response_format", "json")
+    data.add_field("temperature", "0.0")
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(f"{WHISPER_URL}/inference", data=data) as resp:
+            if resp.status != 200:
+                return web.json_response({"error": await resp.text()}, status=resp.status)
+            result = await resp.json()
+            return web.json_response({"text": result.get("text", "").strip()})
+
+async def models(request):
+    return web.json_response({"object": "list", "data": [{"id": "whisper-1", "object": "model"}]})
+
+app = web.Application()
+app.router.add_get("/health", health)
+app.router.add_get("/v1/models", models)
+app.router.add_post("/v1/audio/transcriptions", transcriptions)
+
+if __name__ == "__main__":
+    web.run_app(app, host="127.0.0.1", port=2023)
+```
+
+#### Systemd Services (Linux)
+
+**Whisper server** (`~/.config/systemd/user/voicemode-whisper.service`):
+```ini
+[Unit]
+Description=VoiceMode Whisper STT Server (ROCm)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.voicemode/services/whisper.cpp/build/bin/whisper-server \
+    --model %h/.voicemode/services/whisper.cpp/models/ggml-small.en.bin \
+    --host 127.0.0.1 \
+    --port 2022
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+**Proxy service** (`~/.config/systemd/user/voicemode-whisper-proxy.service`):
+```ini
+[Unit]
+Description=VoiceMode Whisper OpenAI-Compatible Proxy
+After=voicemode-whisper.service
+Requires=voicemode-whisper.service
+
+[Service]
+Type=simple
+ExecStart=%h/.voicemode/services/whisper-proxy-venv/bin/python %h/.voicemode/services/whisper-proxy.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+**Enable services:**
+```bash
+systemctl --user daemon-reload
+systemctl --user enable voicemode-whisper.service voicemode-whisper-proxy.service
+systemctl --user start voicemode-whisper.service voicemode-whisper-proxy.service
+```
+
+#### VoiceMode Configuration
+
+Add to shell profile (`~/.bashrc` or `~/.zshrc`):
+```bash
+export VOICEMODE_STT_BASE_URLS="http://127.0.0.1:2023/v1"
+```
+
+Then restart Claude Code to use your local GPU-accelerated Whisper.
+
+#### Performance (RDNA3)
+
+| Model | Speed | Notes |
+|-------|-------|-------|
+| `small.en` | ~23x realtime | Recommended for most use cases |
+| `medium.en` | ~10x realtime | Better accuracy |
+| `large-v3` | ~5x realtime | Best accuracy |
+
+Example: 11 seconds of audio transcribed in ~480ms on RX 7800 XT.
+
+#### Troubleshooting ROCm
+
+| Problem | Fix |
+|---------|-----|
+| `hipcc not found` | Install ROCm SDK for your distro |
+| `gfx1100 not supported` | Update ROCm or adjust `AMDGPU_TARGETS` |
+| Server starts but slow | Check `rocm-smi` — may be falling back to CPU |
+| Permission denied on GPU | `sudo usermod -aG render,video $USER` then re-login |
+| Proxy not connecting | Verify whisper-server is running on port 2022 |
 
 ## Integration with VoiceMode
 
